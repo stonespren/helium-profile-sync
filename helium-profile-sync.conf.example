@@ -1,0 +1,13 @@
+# helium-profile-sync configuration
+# Copy to ~/.config/helium-profile-sync/config
+# Or run: helium-profile-sync --setup
+
+AWS_PROFILE="default"
+AWS_REGION="us-east-1"
+S3_BUCKET="my-helium-backups"
+S3_PREFIX="helium-profiles"
+HELIUM_DATA_DIR="/home/user/.config/net.imput.helium"
+PROFILE_DIRS="Default,Profile 1"
+SYNC_INTERVAL="15"
+SYNC_DIRECTION="upload-only"
+EXCLUDE_PATTERNS="Service Worker/**,GPUCache/**,Cache/**,Code Cache/**,DawnCache/**,*.lock,*.log,LOCK,Cookies-journal,databases/Databases.db-journal"

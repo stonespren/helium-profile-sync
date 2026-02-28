@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/helium-profile-sync"
+CONFIG_FILE="$CONFIG_DIR/config"
+RCLONE_CONF="$CONFIG_DIR/rclone.conf"
+LOCK_FILE="/tmp/helium-profile-sync-$(id -u).lock"
+BISYNC_STATE_DIR="$CONFIG_DIR/bisync-state"
+
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
+
+msg()  { echo -e "${GREEN}[$(date -Iseconds)]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[$(date -Iseconds)] WARNING:${RESET} $1"; }
+err()  { echo -e "${RED}[$(date -Iseconds)] ERROR:${RESET} $1" >&2; }
+
+usage() {
+    cat <<EOF
+Usage: helium-profile-sync [OPTION]
+
+Options:
+  --setup         Run the interactive setup wizard
+  --sync-now      Trigger an immediate sync
+  --status        Show systemd timer and service status
+  --logs          Show recent journal logs
+  --enable        Enable and start the systemd timer
+  --disable       Disable and stop the systemd timer
+  --dry-run       Perform a sync dry-run (no changes)
+  --restore       Download profiles from S3 (backs up local first, then overwrites)
+  --restore-merge Download profiles from S3 (merge, no local deletions)
+  -h, --help      Show this help message
+  (no args)       Run sync (used by systemd service)
+EOF
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        err "Config not found. Run 'helium-profile-sync --setup' first."
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+}
+
+build_exclude_args() {
+    EXCLUDE_ARGS=()
+    IFS=',' read -ra _patterns <<< "$EXCLUDE_PATTERNS"
+    for pattern in "${_patterns[@]}"; do
+        pattern=$(echo "$pattern" | xargs)  # trim whitespace
+        [[ -n "$pattern" ]] && EXCLUDE_ARGS+=(--exclude "$pattern")
+    done
+}
+
+do_sync() {
+    local dry_run="${1:-false}"
+    local direction_override="${2:-}"
+    load_config
+
+    # Allow callers (e.g. --restore) to override the configured direction
+    if [[ -n "$direction_override" ]]; then
+        SYNC_DIRECTION="$direction_override"
+    fi
+
+    # Locking: prevent overlapping syncs
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
+        warn "Another sync is already running. Exiting."
+        exit 0
+    fi
+
+    mkdir -p "$BISYNC_STATE_DIR"
+
+    build_exclude_args
+
+    local -a common_args=(
+        --config "$RCLONE_CONF"
+        --log-level INFO
+        --s3-no-check-bucket
+        "${EXCLUDE_ARGS[@]}"
+    )
+
+    if [[ "$dry_run" == "true" ]]; then
+        common_args+=(--dry-run)
+        msg "DRY RUN — no changes will be made"
+    fi
+
+    IFS=',' read -ra profiles <<< "$PROFILE_DIRS"
+    local failed=0
+
+    for profile in "${profiles[@]}"; do
+        profile=$(echo "$profile" | xargs)  # trim whitespace
+        local local_path="$HELIUM_DATA_DIR/$profile/"
+        local remote_path="helium-s3:$S3_BUCKET/$S3_PREFIX/$profile/"
+
+        if [[ ! -d "$local_path" ]]; then
+            warn "Profile directory not found: $local_path — skipping"
+            continue
+        fi
+
+        msg "Syncing profile: $profile ($SYNC_DIRECTION)"
+
+        case "$SYNC_DIRECTION" in
+            upload-only)
+                if ! rclone sync "$local_path" "$remote_path" "${common_args[@]}"; then
+                    err "Sync failed for profile: $profile"
+                    failed=$((failed + 1))
+                fi
+                ;;
+            download-only)
+                if ! rclone sync "$remote_path" "$local_path" "${common_args[@]}"; then
+                    err "Sync failed for profile: $profile"
+                    failed=$((failed + 1))
+                fi
+                ;;
+            bidirectional)
+                local resync_flag=""
+                local state_file="$BISYNC_STATE_DIR/${profile//[ \/]/_}.state"
+                if [[ ! -f "$state_file" ]]; then
+                    resync_flag="--resync"
+                    msg "First bisync for '$profile' — running with --resync"
+                fi
+                if rclone bisync "$local_path" "$remote_path" \
+                    ${resync_flag} "${common_args[@]}"; then
+                    touch "$state_file"
+                else
+                    err "Bisync failed for profile: $profile"
+                    rm -f "$state_file"
+                    failed=$((failed + 1))
+                fi
+                ;;
+            *)
+                err "Unknown sync direction: $SYNC_DIRECTION"
+                exit 1
+                ;;
+        esac
+    done
+
+    if (( failed > 0 )); then
+        err "$failed profile(s) failed to sync."
+        exit 1
+    fi
+
+    msg "All profiles synced successfully ✓"
+}
+
+do_restore() {
+    load_config
+
+    warn "This will OVERWRITE local profile data with the S3 copy."
+    echo ""
+
+    IFS=',' read -ra profiles <<< "$PROFILE_DIRS"
+    local has_existing=false
+    for profile in "${profiles[@]}"; do
+        profile=$(echo "$profile" | xargs)
+        local local_path="$HELIUM_DATA_DIR/$profile"
+        if [[ -d "$local_path" ]]; then
+            has_existing=true
+            local size
+            size=$(du -sh "$local_path" 2>/dev/null | cut -f1)
+            warn "LOCAL EXISTS: $profile ($size)"
+        fi
+    done
+
+    if [[ "$has_existing" == "true" ]]; then
+        echo ""
+        msg "Existing local profiles will be backed up before overwriting."
+        echo ""
+    fi
+
+    read -rp "Type 'yes' to confirm restore: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    # ── Back up existing local profiles ──────────────────────
+    local backup_ts
+    backup_ts=$(date +%Y%m%d-%H%M%S)
+    local backup_dir="$CONFIG_DIR/backups/$backup_ts"
+
+    for profile in "${profiles[@]}"; do
+        profile=$(echo "$profile" | xargs)
+        local local_path="$HELIUM_DATA_DIR/$profile"
+        if [[ -d "$local_path" ]]; then
+            local dest="$backup_dir/$profile"
+            msg "Backing up '$profile' → $dest"
+            mkdir -p "$dest"
+            cp -a "$local_path/." "$dest/"
+        fi
+    done
+
+    msg "Local backup saved to: $backup_dir"
+    echo ""
+
+    # ── Now do the actual restore ────────────────────────────
+    do_sync false "download-only"
+
+    echo ""
+    msg "Restore complete. If something went wrong, recover from:"
+    msg "  $backup_dir"
+}
+
+do_restore_merge() {
+    load_config
+    msg "Merging S3 profiles into local (no local files will be deleted)."
+    msg "S3 versions win on conflicts (newer overwrites older)."
+    echo ""
+
+    IFS=',' read -ra profiles <<< "$PROFILE_DIRS"
+    build_exclude_args
+
+    for profile in "${profiles[@]}"; do
+        profile=$(echo "$profile" | xargs)
+        local local_path="$HELIUM_DATA_DIR/$profile/"
+        local remote_path="helium-s3:$S3_BUCKET/$S3_PREFIX/$profile/"
+
+        msg "Merging: $profile"
+        rclone copy "$remote_path" "$local_path" \
+            --config "$RCLONE_CONF" \
+            --log-level INFO \
+            --s3-no-check-bucket \
+            "${EXCLUDE_ARGS[@]}"
+    done
+
+    msg "Merge complete ✓"
+}
+
+case "${1:-}" in
+    --setup)
+        exec helium-profile-sync-setup
+        ;;
+    --sync-now)
+        msg "Triggering immediate sync..."
+        do_sync false
+        ;;
+    --dry-run)
+        do_sync true
+        ;;
+    --restore)
+        do_restore
+        ;;
+    --restore-merge)
+        do_restore_merge
+        ;;
+    --status)
+        echo -e "\n${BOLD}Timer status:${RESET}"
+        systemctl --user status helium-profile-sync.timer --no-pager 2>/dev/null || true
+        echo -e "\n${BOLD}Service status:${RESET}"
+        systemctl --user status helium-profile-sync.service --no-pager 2>/dev/null || true
+        ;;
+    --logs)
+        journalctl --user -u helium-profile-sync.service --since "24 hours ago" --no-pager
+        ;;
+    --enable)
+        systemctl --user daemon-reload
+        systemctl --user enable --now helium-profile-sync.timer
+        msg "Timer enabled and started."
+        ;;
+    --disable)
+        systemctl --user disable --now helium-profile-sync.timer
+        msg "Timer disabled and stopped."
+        ;;
+    -h|--help)
+        usage
+        ;;
+    "")
+        do_sync false
+        ;;
+    *)
+        err "Unknown option: $1"
+        usage
+        exit 1
+        ;;
+esac

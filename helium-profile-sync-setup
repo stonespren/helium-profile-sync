@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/helium-profile-sync"
+CONFIG_FILE="$CONFIG_DIR/config"
+RCLONE_CONF="$CONFIG_DIR/rclone.conf"
+
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
+
+msg()  { echo -e "${GREEN}==>${RESET} ${BOLD}$1${RESET}"; }
+warn() { echo -e "${YELLOW}==> WARNING:${RESET} ${BOLD}$1${RESET}"; }
+err()  { echo -e "${RED}==> ERROR:${RESET} ${BOLD}$1${RESET}" >&2; }
+
+# ── Preflight checks ──────────────────────────────────────────────
+check_dependencies() {
+    local missing=()
+    for cmd in rclone aws jq; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if (( ${#missing[@]} )); then
+        err "Missing required commands: ${missing[*]}"
+        echo "    Install them before running setup."
+        echo "    On Arch: pacman -S rclone aws-cli-v2 jq"
+        exit 1
+    fi
+}
+
+# ── AWS profile helpers ───────────────────────────────────────────
+get_aws_profiles() {
+    aws configure list-profiles 2>/dev/null || true
+}
+
+get_aws_region_for_profile() {
+    local profile="$1"
+    aws configure get region --profile "$profile" 2>/dev/null || echo ""
+}
+
+validate_bucket() {
+    local profile="$1" bucket="$2"
+    if aws s3api head-bucket --bucket "$bucket" --profile "$profile" 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ── Helium profile discovery ─────────────────────────────────────
+HELIUM_DATA_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/net.imput.helium"
+
+discover_profiles() {
+    local profiles=()
+    if [[ -d "$HELIUM_DATA_DIR" ]]; then
+        for dir in "$HELIUM_DATA_DIR"/Default "$HELIUM_DATA_DIR"/Profile\ *; do
+            [[ -d "$dir" ]] && profiles+=("$(basename "$dir")")
+        done
+    fi
+    local IFS=','
+    echo "${profiles[*]}"
+}
+
+# ── Interactive prompts ───────────────────────────────────────────
+prompt() {
+    local var_name="$1" prompt_text="$2" default="${3:-}"
+    local input
+    if [[ -n "$default" ]]; then
+        read -rp "$(echo -e "${BOLD}$prompt_text${RESET} [$default]: ")" input
+        eval "$var_name=\"${input:-$default}\""
+    else
+        while true; do
+            read -rp "$(echo -e "${BOLD}$prompt_text${RESET}: ")" input
+            if [[ -n "$input" ]]; then
+                eval "$var_name=\"$input\""
+                break
+            fi
+            warn "This field is required."
+        done
+    fi
+}
+
+prompt_choice() {
+    local var_name="$1" prompt_text="$2" default="$3"
+    shift 3
+    local options=("$@")
+    echo -e "\n${BOLD}$prompt_text${RESET}"
+    for i in "${!options[@]}"; do
+        local marker="  "
+        [[ "${options[$i]}" == "$default" ]] && marker="* "
+        echo "  $((i+1))) ${marker}${options[$i]}"
+    done
+    local choice
+    read -rp "Choose [1-${#options[@]}] (default: $default): " choice
+    if [[ -z "$choice" ]]; then
+        eval "$var_name=\"$default\""
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
+        eval "$var_name=\"${options[$((choice-1))]}\""
+    else
+        warn "Invalid choice, using default: $default"
+        eval "$var_name=\"$default\""
+    fi
+}
+
+# ── Main setup flow ──────────────────────────────────────────────
+main() {
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}║   Helium Profile Sync — Setup Wizard     ║${RESET}"
+    echo -e "${BOLD}╚══════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    check_dependencies
+
+    # ── 1. AWS Profile ────────────────────────────────────────
+    msg "Detecting AWS profiles..."
+    local available_profiles
+    available_profiles=$(get_aws_profiles)
+
+    if [[ -z "$available_profiles" ]]; then
+        err "No AWS profiles found in ~/.aws/credentials or ~/.aws/config"
+        echo "    Run 'aws configure --profile <name>' first."
+        exit 1
+    fi
+
+    echo "    Available profiles: $available_profiles"
+    prompt AWS_PROFILE "AWS profile name" "default"
+
+    if ! echo "$available_profiles" | grep -qw "$AWS_PROFILE"; then
+        err "Profile '$AWS_PROFILE' not found in AWS config."
+        exit 1
+    fi
+
+    # ── 2. Region ─────────────────────────────────────────────
+    local detected_region
+    detected_region=$(get_aws_region_for_profile "$AWS_PROFILE")
+    if [[ -n "$detected_region" ]]; then
+        msg "Detected region from AWS profile: $detected_region"
+    fi
+    prompt AWS_REGION "AWS region" "${detected_region:-us-east-1}"
+
+    # ── 3. S3 Bucket ─────────────────────────────────────────
+    prompt S3_BUCKET "S3 bucket name (must already exist)"
+
+    msg "Validating bucket access..."
+    if ! validate_bucket "$AWS_PROFILE" "$S3_BUCKET"; then
+        warn "Cannot confirm bucket '$S3_BUCKET' exists or is accessible."
+        read -rp "Continue anyway? [y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
+    else
+        msg "Bucket '$S3_BUCKET' is accessible ✓"
+    fi
+
+    prompt S3_PREFIX "S3 key prefix (subfolder, e.g. 'helium-sync')" "helium-profiles"
+
+    # ── 4. Helium profiles ────────────────────────────────────
+    msg "Scanning for Helium browser profiles in $HELIUM_DATA_DIR ..."
+    local discovered
+    discovered=$(discover_profiles)
+
+    if [[ -n "$discovered" ]]; then
+        echo "    Found profiles: $discovered"
+    else
+        warn "No profiles auto-detected."
+    fi
+
+    echo ""
+    echo -e "${BOLD}Enter profile directory names to sync (comma-separated).${RESET}"
+    echo "    These are folder names inside $HELIUM_DATA_DIR"
+    echo "    (e.g. Default, Profile 1, Profile 2)"
+    prompt PROFILE_DIRS "Profile directories" "$discovered"
+
+    # ── 5. Sync settings ─────────────────────────────────────
+    prompt SYNC_INTERVAL "Sync interval in minutes" "15"
+
+    prompt_choice SYNC_DIRECTION "Sync direction" "upload-only" \
+        "upload-only" "download-only" "bidirectional"
+
+    if [[ "$SYNC_DIRECTION" == "bidirectional" ]]; then
+        warn "Bidirectional sync uses rclone bisync. On first run it"
+        warn "requires --resync. The service handles this automatically."
+    fi
+
+    # ── 6. Exclude patterns ──────────────────────────────────
+    echo ""
+    msg "Default exclude patterns (large/temp Chromium files):"
+    local default_excludes="Service Worker/**,GPUCache/**,Cache/**,Code Cache/**,DawnCache/**,*.lock,*.log,LOCK,Cookies-journal,databases/Databases.db-journal"
+    echo "    $default_excludes"
+    prompt EXCLUDE_PATTERNS "Exclude patterns (comma-separated)" "$default_excludes"
+
+    # ── 7. Write config ──────────────────────────────────────
+    msg "Writing configuration..."
+    mkdir -p "$CONFIG_DIR"
+
+    cat > "$CONFIG_FILE" <<EOF
+# helium-profile-sync configuration
+# Generated on $(date -Iseconds)
+
+AWS_PROFILE="$AWS_PROFILE"
+AWS_REGION="$AWS_REGION"
+S3_BUCKET="$S3_BUCKET"
+S3_PREFIX="$S3_PREFIX"
+HELIUM_DATA_DIR="$HELIUM_DATA_DIR"
+PROFILE_DIRS="$PROFILE_DIRS"
+SYNC_INTERVAL="$SYNC_INTERVAL"
+SYNC_DIRECTION="$SYNC_DIRECTION"
+EXCLUDE_PATTERNS="$EXCLUDE_PATTERNS"
+EOF
+
+    chmod 600 "$CONFIG_FILE"
+    msg "Config written to $CONFIG_FILE"
+
+    # ── 8. Generate rclone remote config ─────────────────────
+    msg "Generating rclone config..."
+    cat > "$RCLONE_CONF" <<EOF
+[helium-s3]
+type = s3
+provider = AWS
+env_auth = true
+profile = $AWS_PROFILE
+region = $AWS_REGION
+acl = private
+EOF
+
+    chmod 600 "$RCLONE_CONF"
+    msg "rclone config written to $RCLONE_CONF"
+
+    # ── 9. Create timer drop-in for custom interval ──────────
+    local DROPIN_DIR="$HOME/.config/systemd/user/helium-profile-sync.timer.d"
+    mkdir -p "$DROPIN_DIR"
+    cat > "$DROPIN_DIR/interval.conf" <<EOF
+[Timer]
+OnUnitActiveSec=
+OnUnitActiveSec=${SYNC_INTERVAL}min
+EOF
+
+    # ── 10. Enable systemd timer ─────────────────────────────
+    msg "Enabling systemd user timer..."
+    systemctl --user daemon-reload
+    systemctl --user enable --now helium-profile-sync.timer
+
+    echo ""
+    echo -e "${GREEN}══════════��═══════════════════════════════${RESET}"
+    echo -e "${GREEN}  Setup complete!${RESET}"
+    echo -e "${GREEN}══════════════════════════════════════════${RESET}"
+    echo ""
+    echo "  Config:        $CONFIG_FILE"
+    echo "  rclone config: $RCLONE_CONF"
+    echo "  Sync interval: every $SYNC_INTERVAL minutes"
+    echo "  Direction:     $SYNC_DIRECTION"
+    echo ""
+    echo "  Useful commands:"
+    echo "    helium-profile-sync --status        Show timer/service status"
+    echo "    helium-profile-sync --sync-now      Trigger an immediate sync"
+    echo "    helium-profile-sync --dry-run       Preview changes"
+    echo "    helium-profile-sync --logs          View recent logs"
+    echo "    helium-profile-sync --restore       Overwrite local with S3 (backs up first)"
+    echo "    helium-profile-sync --restore-merge Merge S3 into local (no deletions)"
+    echo "    helium-profile-sync --setup         Re-run this wizard"
+    echo ""
+}
+
+main "$@"

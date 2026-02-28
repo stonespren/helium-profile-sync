@@ -1,0 +1,12 @@
+[Unit]
+Description=Helium Browser Profile S3 Sync Timer
+
+[Timer]
+# First run 2 minutes after boot/login
+OnBootSec=2min
+# Then repeat based on user-configured interval (overridden by drop-in)
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

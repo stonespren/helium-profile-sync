@@ -1,0 +1,2 @@
+  --restore       Download profiles from S3 (backs up local first, then overwrites)
+  --restore-merge Download profiles from S3 (merge, no local deletions)

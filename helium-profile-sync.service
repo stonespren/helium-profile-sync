@@ -1,0 +1,20 @@
+[Unit]
+Description=Helium Browser Profile S3 Sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/helium-profile-sync
+Environment=HOME=%h
+Environment=XDG_CONFIG_HOME=%h/.config
+
+# Hardening
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%h/.config/helium-profile-sync %h/.config/helium /tmp
+ReadOnlyPaths=%h/.aws
+
+[Install]
+WantedBy=default.target
