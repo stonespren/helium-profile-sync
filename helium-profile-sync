@@ -31,6 +31,7 @@ Options:
   --dry-run       Perform a sync dry-run (no changes)
   --restore       Download profiles from S3 (backs up local first, then overwrites)
   --restore-merge Download profiles from S3 (merge, no local deletions)
+  --register      Register synced profiles in Helium's Local State file
   -h, --help      Show this help message
   (no args)       Run sync (used by systemd service)
 EOF
@@ -52,6 +53,121 @@ build_exclude_args() {
         pattern=$(echo "$pattern" | xargs)  # trim whitespace
         [[ -n "$pattern" ]] && EXCLUDE_ARGS+=(--exclude "$pattern")
     done
+}
+
+# ── Register synced profiles in Helium's Local State ──────────
+# Chromium-based browsers track known profiles in a "Local State"
+# JSON file.  If a profile folder is synced to a new machine but
+# has no entry in profile.info_cache, the browser won't show it.
+# This function reads each synced profile's Preferences to get
+# its display name and avatar, then inserts a stub entry into
+# Local State so Helium recognizes it on next launch.
+register_profiles() {
+    local local_state="$HELIUM_DATA_DIR/Local State"
+
+    if ! command -v jq &>/dev/null; then
+        warn "jq not found — skipping Local State registration."
+        return
+    fi
+
+    # Ensure Local State exists with minimal structure
+    if [[ ! -f "$local_state" ]]; then
+        msg "Creating new Local State file"
+        cat > "$local_state" <<'TMPL'
+{
+  "profile": {
+    "info_cache": {},
+    "last_active_profiles": [],
+    "last_used": "Default",
+    "metrics": { "next_bucket_index": 1 },
+    "profiles_created": 0,
+    "profiles_order": []
+  }
+}
+TMPL
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    cp "$local_state" "$tmp"
+
+    IFS=',' read -ra profiles <<< "$PROFILE_DIRS"
+    local registered=0
+
+    for profile in "${profiles[@]}"; do
+        profile=$(echo "$profile" | xargs)
+        local profile_path="$HELIUM_DATA_DIR/$profile"
+        local prefs="$profile_path/Preferences"
+
+        if [[ ! -d "$profile_path" ]]; then
+            continue
+        fi
+
+        # Check if already registered
+        if jq -e --arg p "$profile" '.profile.info_cache[$p]' "$tmp" &>/dev/null; then
+            continue
+        fi
+
+        # Read name and avatar from the profile's Preferences
+        local display_name="$profile"
+        local avatar_index=0
+        if [[ -f "$prefs" ]]; then
+            display_name=$(jq -r '.profile.name // empty' "$prefs" 2>/dev/null) || true
+            avatar_index=$(jq -r '.profile.avatar_index // 0' "$prefs" 2>/dev/null) || true
+            [[ -z "$display_name" ]] && display_name="$profile"
+        fi
+
+        local now
+        now=$(date +%s.%N)
+        local next_bucket
+        next_bucket=$(jq '.profile.metrics.next_bucket_index // 1' "$tmp")
+
+        msg "Registering profile in Local State: $profile (\"$display_name\")"
+
+        jq --arg p "$profile" \
+           --arg name "$display_name" \
+           --argjson avatar "$avatar_index" \
+           --argjson now "$now" \
+           --argjson bucket "$next_bucket" \
+        '
+          .profile.info_cache[$p] = {
+            "active_time": $now,
+            "avatar_icon": ("chrome://theme/IDR_PROFILE_AVATAR_" + ($avatar | tostring)),
+            "background_apps": false,
+            "default_avatar_fill_color": -1,
+            "default_avatar_stroke_color": -1,
+            "enterprise_label": "",
+            "force_signin_profile_locked": false,
+            "gaia_given_name": "",
+            "gaia_id": "",
+            "gaia_name": "",
+            "hosted_domain": "",
+            "is_consented_primary_account": false,
+            "is_ephemeral": false,
+            "is_using_default_avatar": true,
+            "is_using_default_name": false,
+            "managed_user_id": "",
+            "metrics_bucket_index": $bucket,
+            "name": $name,
+            "user_name": ""
+          }
+          | .profile.metrics.next_bucket_index = ($bucket + 1)
+          | .profile.profiles_created = ([.profile.profiles_created, (.profile.info_cache | length)] | max)
+          | .profile.profiles_order = (.profile.profiles_order + [$p] | unique)
+          | .profile.last_active_profiles = (.profile.last_active_profiles + [$p] | unique)
+        ' "$tmp" > "${tmp}.new" && mv "${tmp}.new" "$tmp"
+
+        registered=$((registered + 1))
+    done
+
+    if (( registered > 0 )); then
+        cp "$tmp" "$local_state"
+        msg "Registered $registered new profile(s) in Local State ✓"
+    else
+        msg "All profiles already registered in Local State ✓"
+    fi
+
+    rm -f "$tmp"
 }
 
 do_sync() {
@@ -144,6 +260,11 @@ do_sync() {
     fi
 
     msg "All profiles synced successfully ✓"
+
+    # Register profiles in Local State after downloading data
+    if [[ "$SYNC_DIRECTION" == "download-only" || "$SYNC_DIRECTION" == "bidirectional" ]]; then
+        register_profiles
+    fi
 }
 
 do_restore() {
@@ -199,6 +320,9 @@ do_restore() {
     # ── Now do the actual restore ────────────────────────────
     do_sync false "download-only"
 
+    # Register profiles in Local State so Helium recognizes them
+    register_profiles
+
     echo ""
     msg "Restore complete. If something went wrong, recover from:"
     msg "  $backup_dir"
@@ -226,6 +350,9 @@ do_restore_merge() {
             "${EXCLUDE_ARGS[@]}"
     done
 
+    # Register profiles in Local State so Helium recognizes them
+    register_profiles
+
     msg "Merge complete ✓"
 }
 
@@ -245,6 +372,10 @@ case "${1:-}" in
         ;;
     --restore-merge)
         do_restore_merge
+        ;;
+    --register)
+        load_config
+        register_profiles
         ;;
     --status)
         echo -e "\n${BOLD}Timer status:${RESET}"

@@ -147,6 +147,7 @@ helium-profile-sync [OPTION]
 | `--dry-run`       | Perform a sync dry-run — shows what would be transferred without making changes.                                                                                                               |
 | `--restore`       | Download profiles from S3, **overwriting** local data. Existing local profiles are backed up to `~/.config/helium-profile-sync/backups/<timestamp>/` first. Requires interactive confirmation. |
 | `--restore-merge` | Download profiles from S3, **merging** into local. No local files are deleted; S3 versions win on conflicts (newer overwrites older).                                                          |
+| `--register`      | Register synced profile folders in Helium's `Local State` file so the browser recognizes them.                                                                                                 |
 | `--status`        | Show the current state of the systemd timer and service.                                                                                                                                       |
 | `--logs`          | Show journal logs from the last 24 hours for the sync service.                                                                                                                                 |
 | `--enable`        | Enable and start the systemd user timer.                                                                                                                                                       |
@@ -169,6 +170,20 @@ helium-profile-sync [OPTION]
 | **Backup first**     | Yes (timestamped copy)         | No                                           |
 | **Confirmation**     | Required (`yes`)               | Not required                                 |
 | **Use case**         | Clean restore on a new machine | Pull in S3 changes without losing local data |
+
+### Profile Registration (Local State)
+
+Chromium-based browsers (including Helium) maintain a `Local State` JSON file at the root of the browser data directory. This file contains `profile.info_cache` — a registry of known profile folders. If a profile folder exists on disk but has no entry in `Local State`, **the browser won't show it in the profile picker**.
+
+`--restore`, `--restore-merge`, and download-only / bidirectional syncs automatically register any new profile folders in `Local State` after syncing. You can also run it manually:
+
+```bash
+helium-profile-sync --register
+```
+
+The registration reads each profile's `Preferences` file to extract the display name and avatar, then writes a minimal entry into `profile.info_cache`. Profiles that are already registered are left untouched.
+
+> **Note:** Close Helium before running `--register` (or any restore). The browser overwrites `Local State` on exit, which would discard your changes.
 
 ## Configuration
 
@@ -266,6 +281,9 @@ This happens when bisync fails — the state file is removed to force a clean re
 
 **Bucket access denied**
 Ensure your AWS profile has `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` permissions on the target bucket.
+
+**Restored profiles don't appear in Helium**
+Helium tracks known profiles in `~/.config/net.imput.helium/Local State`. If you synced profile folders manually or the automatic registration was skipped, run `helium-profile-sync --register`. Make sure Helium is **closed** first — the browser writes `Local State` on exit and would overwrite your changes.
 
 ## License
 
